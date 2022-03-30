@@ -152,6 +152,42 @@ func HandleWalShow(rootFolder storage.Folder, showBackups bool, outputWriter Wal
 	tracelog.ErrorLogger.FatalfOnError("Error writing output: %v\n", err)
 }
 
+// get archive state
+func GetWal(rootFolder storage.Folder, showBackups bool) (timelineinfo []*TimelineInfo) {
+	walFolder := rootFolder.GetSubFolder(utility.WalPath)
+	filenames, err := getFolderFilenames(walFolder)
+	tracelog.ErrorLogger.FatalfOnError("Failed to get the WAL folder filenames %v\n", err)
+
+	walSegments := getSegmentsFromFiles(filenames)
+	segmentsByTimelines := groupSegmentsByTimelines(walSegments)
+
+	timelineInfos := make([]*TimelineInfo, 0, len(segmentsByTimelines))
+	for _, segmentsSequence := range segmentsByTimelines {
+		historyRecords, err := getTimeLineHistoryRecords(segmentsSequence.timelineID, walFolder)
+		if err != nil {
+			if _, ok := err.(HistoryFileNotFoundError); !ok {
+				tracelog.ErrorLogger.Fatalf("Error while loading .history file %v\n", err)
+			}
+		}
+
+		info, err := NewTimelineInfo(segmentsSequence, historyRecords)
+		tracelog.ErrorLogger.FatalfOnError("Error while creating TimeLineInfo %v\n", err)
+		timelineInfos = append(timelineInfos, info)
+	}
+
+	if showBackups {
+		timelineInfos, err = addBackupsInfo(timelineInfos, rootFolder)
+		tracelog.ErrorLogger.FatalfOnError("Failed to add backups info: %v\n", err)
+	}
+
+	// order timelines by ID
+	sort.Slice(timelineInfos, func(i, j int) bool {
+		return timelineInfos[i].ID < timelineInfos[j].ID
+	})
+
+	return timelineInfos
+}
+
 func groupSegmentsByTimelines(segments map[WalSegmentDescription]bool) map[uint32]*WalSegmentsSequence {
 	segmentsByTimelines := make(map[uint32]*WalSegmentsSequence)
 	for segment := range segments {

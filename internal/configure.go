@@ -194,6 +194,10 @@ func GetPgSlotName() (pgSlotName string) {
 	return
 }
 
+func GetPgWalDepth() (pgWalDepth int) {
+	return viper.GetInt(PgWalDepth)
+}
+
 // TODO : unit tests
 func ConfigureCompressor() (compression.Compressor, error) {
 	compressionMethod := viper.GetString(CompressionMethodSetting)

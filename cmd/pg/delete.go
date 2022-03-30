@@ -8,6 +8,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"github.com/wal-g/tracelog"
 	"github.com/wal-g/wal-g/internal"
 	"github.com/wal-g/wal-g/pkg/storages/storage"
@@ -54,6 +55,18 @@ var deleteTargetCmd = &cobra.Command{
 	Example: internal.DeleteTargetExamples,
 	Args:    internal.DeleteTargetArgsValidator,
 	Run:     runDeleteTarget,
+}
+
+var deleteWALCmd = &cobra.Command{
+	Use:     internal.DeleteWalUsageExample, // TODO : improve description
+	Example: internal.DeleteWalExamples,
+	Args:    internal.DeleteWalArgsValidator,
+	Run:     runDeleteWal,
+}
+
+type TimelineRetentionData struct {
+	anchorSegno     uint64
+	retainInternals [][2]uint64
 }
 
 func runDeleteBefore(cmd *cobra.Command, args []string) {
@@ -125,13 +138,70 @@ func runDeleteTarget(cmd *cobra.Command, args []string) {
 	deleteHandler.HandleDeleteTarget(targetBackupSelector, confirmed, findFullBackup)
 }
 
+func runDeleteWal(cmd *cobra.Command, args []string) {
+	folder, err := internal.ConfigureFolder()
+	tracelog.ErrorLogger.FatalOnError(err)
+
+	pgWalDepth := internal.GetPgWalDepth()
+	postgres.SetWalSize(viper.GetUint64(internal.PgWalSize))
+
+	tracelog.InfoLogger.Printf("WAL depth: %v\n", pgWalDepth)
+
+	if pgWalDepth <= 0 {
+		tracelog.ErrorLogger.Printf("Nothing to do\n")
+	}
+
+	tracelog.InfoLogger.Printf("Conf: %v\n", confirmed)
+
+	timelineInfos := postgres.GetWal(folder, true)
+
+	// get list of backups, get StartSegno of AnchorBackup(pointed by WAL DEPTH),
+	// set StartSegno as AnchorSegno, every segno greater or equal to this are saved from purge
+
+	var tliRetentionData TimelineRetentionData
+
+	tliRetentionData.retainInternals = make([][2]uint64, 0, 0)
+	tliRetentionData.anchorSegno = 0
+
+	for _, info := range timelineInfos {
+		tracelog.InfoLogger.Printf("Start Segments: %s\n", info.StartSegment)
+		var anchorSegno uint64
+
+		for i, backup := range info.Backups {
+			// every segment since anchor must be preserved
+			if i == pgWalDepth-1 {
+				anchorSegno = backup.StartLsn / postgres.WalSegmentSize
+
+				if tliRetentionData.anchorSegno == 0 || anchorSegno < tliRetentionData.anchorSegno {
+					tliRetentionData.anchorSegno = anchorSegno
+				}
+			}
+
+			// convert lsn into segno arrays
+			var walInterval [2]uint64
+			walInterval[0] = backup.StartLsn / postgres.WalSegmentSize
+			walInterval[1] = backup.FinishLsn / postgres.WalSegmentSize
+			//tliRetentionData[j].retainInternals = append(tliRetentionData[j].retainInternals, walInterval)
+			tliRetentionData.retainInternals = append(tliRetentionData.retainInternals, walInterval)
+		}
+	}
+
+	//	permanentBackups, permanentWals := postgres.GetPermanentBackupsAndWals(folder)
+	//	deleteHandler, err := newPostgresDeleteHandler(folder, permanentBackups, permanentWals)
+	deleteHandler, err := newPostgresDeleteHandler(folder, map[string]bool{}, map[string]bool{})
+	tracelog.ErrorLogger.FatalOnError(err)
+
+	deleteHandler.Modify(tliRetentionData.retainInternals, tliRetentionData.anchorSegno)
+	deleteHandler.HandleDeleteWAL(confirmed)
+}
+
 func init() {
 	Cmd.AddCommand(deleteCmd)
 
 	deleteTargetCmd.Flags().StringVar(
 		&deleteTargetUserData, internal.DeleteTargetUserDataFlag, "", internal.DeleteTargetUserDataDescription)
 
-	deleteCmd.AddCommand(deleteRetainCmd, deleteBeforeCmd, deleteEverythingCmd, deleteTargetCmd)
+	deleteCmd.AddCommand(deleteRetainCmd, deleteBeforeCmd, deleteEverythingCmd, deleteTargetCmd, deleteWALCmd)
 	deleteCmd.PersistentFlags().BoolVar(&confirmed, internal.ConfirmFlag, false, "Confirms backup deletion")
 	deleteCmd.PersistentFlags().BoolVar(&useSentinelTime, UseSentinelTimeFlag, false, UseSentinelTimeDescription)
 }

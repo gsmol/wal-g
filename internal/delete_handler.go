@@ -40,10 +40,13 @@ const (
   target base_0000000100000000000000C9_D_0000000100000000000000C4	delete delta backup and all dependant delta backups 
   target FIND_FULL base_0000000100000000000000C9_D_0000000100000000000000C4	delete delta backup and all delta backups with the same base backup`  //nolint:lll
 
+	DeleteWalExamples = `wal-g delete wal --pg-wal-depth 3`
+
 	DeleteEverythingUsageExample = "everything [FORCE]"
 	DeleteRetainUsageExample     = "retain [FULL|FIND_FULL] backup_count"
 	DeleteBeforeUsageExample     = "before [FIND_FULL] backup_name|timestamp"
 	DeleteTargetUsageExample     = "target [FIND_FULL] backup_name | --target-user-data <data>"
+	DeleteWalUsageExample        = "wal --wal-depth NUM"
 
 	DeleteTargetUserDataFlag        = "target-user-data"
 	DeleteTargetUserDataDescription = "delete storage backup which has the specified user data"
@@ -106,7 +109,15 @@ type DeleteHandler struct {
 	less    func(object1, object2 storage.Object) bool
 	greater func(object1, object2 storage.Object) bool
 
-	isPermanent func(object storage.Object) bool
+	isPermanent     func(object storage.Object) bool
+	retainInternals [][2]uint64
+	anchorSegno     uint64
+}
+
+func (h *DeleteHandler) Modify(retainInternals [][2]uint64, anchorSegno uint64) {
+
+	h.anchorSegno = anchorSegno
+	h.retainInternals = retainInternals
 }
 
 func (h *DeleteHandler) HandleDeleteBefore(args []string, confirmed bool) {
@@ -212,6 +223,10 @@ func (h *DeleteHandler) HandleDeleteEverything(args []string, permanentBackups m
 		tracelog.InfoLogger.Printf("Found permanent backups=%v\n", permanentBackups)
 	}
 	h.DeleteEverything(confirmed)
+}
+
+func (h *DeleteHandler) HandleDeleteWAL(confirmed bool) {
+	h.DeleteWAL(confirmed)
 }
 
 func (h *DeleteHandler) FindTargetBeforeName(name string, modifier int) (BackupObject, error) {
@@ -326,6 +341,114 @@ func (h *DeleteHandler) DeleteEverything(confirmed bool) {
 	filter := func(object storage.Object) bool { return true }
 	err := storage.DeleteObjectsWhere(h.Folder, confirmed, filter)
 	tracelog.ErrorLogger.FatalOnError(err)
+}
+
+type WalSegmentNo uint64
+
+type WalSegmentNotFoundError struct {
+	error
+}
+
+type WalSegmentDescription struct {
+	Number   WalSegmentNo
+	Timeline uint32
+}
+
+type NotWalFilenameError struct {
+	error
+}
+
+type IncorrectLogSegNoError struct {
+	error
+}
+
+const (
+	WalSegmentSize        = uint64(16 * 1024 * 1024)
+	xLogSegmentsPerXLogID = 0x100000000 / WalSegmentSize
+	sizeofInt32           = 4
+	sizeofInt32bits       = sizeofInt32 * 8
+	hexadecimal           = 16
+)
+
+func (h *DeleteHandler) DeleteWAL(confirmed bool) {
+
+	tracelog.InfoLogger.Println("Start delete")
+
+	filter := func(object storage.Object) bool {
+
+		if !strings.HasPrefix(object.GetName(), utility.WalPath) {
+			return false
+		}
+
+		baseName := utility.TrimFileExtension(object.GetName())
+		fileName := utility.StripPrefixName(baseName)
+		segment, err := NewWalSegmentDescription(fileName)
+
+		if _, ok := err.(NotWalFilenameError); ok {
+			// non-wal segment file, skip it
+			return false
+		}
+
+		// keep segment equal or greater than anchor
+		if uint64(segment.Number) >= h.anchorSegno {
+			return false
+		}
+
+		for _, interval := range h.retainInternals {
+
+			// keep segment if it is required for consistent recovery
+			if uint64(segment.Number) >= interval[0] && uint64(segment.Number) <= interval[1] {
+				return false
+			}
+		}
+
+		return true
+	}
+	err := storage.DeleteObjectsWhere(h.Folder, confirmed, filter)
+	tracelog.ErrorLogger.FatalOnError(err)
+}
+
+func newNotWalFilenameError(filename string) NotWalFilenameError {
+	return NotWalFilenameError{errors.Errorf("expected to get wal filename, but found: '%s'", filename)}
+}
+
+func newIncorrectLogSegNoError(name string) IncorrectLogSegNoError {
+	return IncorrectLogSegNoError{errors.Errorf("Incorrect logSegNoLo in WAL file name: %s", name)}
+}
+
+func ParseWALFilename(name string) (timelineID uint32, logSegNo uint64, err error) {
+	if len(name) != 24 {
+		err = newNotWalFilenameError(name)
+		return
+	}
+	timelineID64, err := strconv.ParseUint(name[0:8], 0x10, sizeofInt32bits)
+	timelineID = uint32(timelineID64)
+	if err != nil {
+		return
+	}
+	logSegNoHi, err := strconv.ParseUint(name[8:16], 0x10, sizeofInt32bits)
+	if err != nil {
+		return
+	}
+	logSegNoLo, err := strconv.ParseUint(name[16:24], 0x10, sizeofInt32bits)
+	if err != nil {
+		return
+	}
+	if logSegNoLo >= xLogSegmentsPerXLogID {
+		err = newIncorrectLogSegNoError(name)
+		return
+	}
+
+	logSegNo = logSegNoHi*xLogSegmentsPerXLogID + logSegNoLo
+	return
+}
+
+func NewWalSegmentDescription(name string) (WalSegmentDescription, error) {
+	timeline, segmentNo, err := ParseWALFilename(name)
+	if err != nil {
+		return WalSegmentDescription{}, err
+	}
+	return WalSegmentDescription{Timeline: timeline, Number: WalSegmentNo(segmentNo)}, nil
 }
 
 func (h *DeleteHandler) DeleteBeforeTarget(target BackupObject, confirmed bool) error {
@@ -576,6 +699,10 @@ func DeleteRetainAfterArgsValidator(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("cannot delete retain future date")
 		}
 	}
+	return nil
+}
+
+func DeleteWalArgsValidator(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
